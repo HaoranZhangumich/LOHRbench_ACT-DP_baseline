@@ -33,6 +33,17 @@ from act.detr.detr_vae import build_encoder, DETRVAE
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
 import tyro
+# Task instructions mapping 
+TASK_INSTRUCTIONS = {
+    "reverse_stack": "reverse 10 stacked cube in reverse order",
+    "stack_10_cube": "stack 10 cube together, start with red cube",
+    "stack_cube_clutter": "stack 3 cube together , start with red cube",
+    "cluttered_packing": "put three cube in to the bowl",
+    "pick_active_exploration": "pick up the can, screwdriver and cup out of the drawer",
+    "stack_active_exploration": "pick up the cube and stack them together, start with red cube",
+    "fruit_placement": "place four starberries into the target position",
+    "repackage": "put cube into the bowl and stack the bowl on the plate",
+}
 
 @dataclass
 class Args:

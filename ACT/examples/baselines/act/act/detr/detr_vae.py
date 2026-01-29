@@ -32,7 +32,7 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, action_dim, num_queries):
+    def __init__(self, backbones, transformer, encoder, state_dim, action_dim, num_queries, lang_embed_dim=None):
         super().__init__()
         self.num_queries = num_queries
         self.transformer = transformer
@@ -60,7 +60,16 @@ class DETRVAE(nn.Module):
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for state and proprio
 
-    def forward(self, obs, actions=None):
+        # language conditioning (optional)
+        self.lang_proj = None
+        if lang_embed_dim is not None:
+            self.lang_proj = nn.Sequential(
+                nn.Linear(lang_embed_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, hidden_dim),
+            )
+
+    def forward(self, obs, actions=None, lang_embed=None):
         is_training = actions is not None
         state = obs['state'] if self.backbones is not None else obs
         bs = state.shape[0]
@@ -110,14 +119,18 @@ class DETRVAE(nn.Module):
                 all_cam_features.append(self.input_proj(features))
                 all_cam_pos.append(pos)
 
-            # proprioception features (state)
+            # proprioception features (state) + optional language conditioning
             proprio_input = self.input_proj_robot_state(state)
+            if self.lang_proj is not None and lang_embed is not None:
+                proprio_input = proprio_input + self.lang_proj(lang_embed)
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3) # (batch, hidden_dim, 4, 8)
             pos = torch.cat(all_cam_pos, axis=3) # (batch, hidden_dim, 4, 8)
             hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0] # (batch, num_queries, hidden_dim)
         else:
             state = self.input_proj_robot_state(state)
+            if self.lang_proj is not None and lang_embed is not None:
+                state = state + self.lang_proj(lang_embed)
             hs = self.transformer(None, None, self.query_embed.weight, None, latent_input, state, self.additional_pos_embed.weight)[0]
 
         a_hat = self.action_head(hs)

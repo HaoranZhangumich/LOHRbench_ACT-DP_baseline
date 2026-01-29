@@ -2,3 +2,4 @@ __pycache__/
 runs/
 wandb/
 *.egg-info/
+DP/examples/baselines/diffusion_policy/cache_lohrbench_dp/*

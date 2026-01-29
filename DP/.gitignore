@@ -44,3 +44,4 @@ imgui.ini
 # testing
 .coverage*
 htmlcov/
+DP/examples/baselines/diffusion_policy/cache_lohrbench_dp/*
