@@ -35,11 +35,17 @@ LOHRbench_ACT-DP_baseline/
 ## Setup
 
 ```bash
+conda create -n dp python=3.12.12 -y
+conda activate <environment-name>
+
+# Install torch
+python -m pip install "torch==2.5.1+cu121" --index-url https://download.pytorch.org/whl/cu121
+
 # Install DP
-cd DP && pip install -e . && cd ..
+cd DP/examples/baselines/diffusion_policy && pip install -e . && cd ../../../..
 
 # Install ACT
-cd ACT && pip install -e . && cd ..
+cd ACT/examples/baselines/act && pip install -e . && cd ../../../..
 
 # Both require CLIP for language conditioning
 pip install transformers
