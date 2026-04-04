@@ -48,6 +48,52 @@ python train_rgbd.py --env-id PickCube-v1 \
   --track
 ```
 
+## LoHRbench Multi-Task Training
+
+Train a language-conditioned Diffusion Policy on all 8 LoHRbench manipulation tasks with CLIP conditioning:
+
+```bash
+python train_lohrbench.py \
+  --data-root /path/to/LoHRbench --run-root ./runs \
+  --total-iters 500000 --batch-size 256 --track
+```
+
+### HDF5 Rechunking (Optional)
+
+Speeds up image reads ~10-20x:
+
+```bash
+python preprocess_lohrbench.py \
+  --data-root /path/to/LoHRbench --output-root /path/to/LoHRbench_rechunked --compression lzf
+```
+
+## LoHRbench Evaluation
+
+To evaluate a trained checkpoint:
+
+```bash
+export DP_ROOT="/path/to/diffusion_policy"  # path to this directory
+
+python eval.py \
+  --policy dp \
+  --checkpoint /path/to/checkpoints/final.pt \
+  --benchmark-root /path/to/LoHRbench/benchmark/table-top \
+  --use-action-chunking \
+  --chunk-size 8 \
+  --results-dir ./results \
+  --num-episodes 10 \
+  --max-steps 3100 \
+  --task-names stack_active_exploration \
+  --camera-width 128 \
+  --camera-height 128 \
+  --save-video \
+  --record-dir ./recordings
+```
+
+The 8 available tasks are: `reverse_stack`, `stack_10_cube`, `stack_cube_clutter`, `cluttered_packing`, `pick_active_exploration`, `stack_active_exploration`, `fruit_placement`, `repackage`.
+
+The model variant (PlainConv vs ResNet18) is automatically detected from the checkpoint.
+
 ## Citation
 
 If you use this baseline please cite the following

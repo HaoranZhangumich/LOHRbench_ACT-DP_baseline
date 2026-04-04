@@ -1,5 +1,8 @@
 __pycache__/
 runs/
 wandb/
+wandb_logs/
 *.egg-info/
-DP/examples/baselines/diffusion_policy/cache_lohrbench_dp/*
+*.log
+CLAUDE.md
+cache_lohrbench_dp/

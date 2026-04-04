@@ -12,8 +12,8 @@ Fixes:
 
 Run:
 python train_lohrbench.py \
-  --data-root /data1/LoHRbench \
-  --run-root /data/haoran/projects \
+  --data-root /path/to/LoHRbench \
+  --run-root ./runs \
   --total-iters 100000 \
   --batch-size 256 \
   --obs-horizon 2 \
@@ -22,8 +22,7 @@ python train_lohrbench.py \
   --save-freq 2000 \
   --log-freq 200 \
   --track \
-  --wandb_project_name LoHRbench \
-  --wandb_entity haoranwh
+  --wandb_project_name LoHRbench
 """
 
 from __future__ import annotations
@@ -61,6 +60,7 @@ from diffusers.training_utils import EMAModel
 
 from diffusion_policy.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.plain_conv import PlainConv
+from diffusion_policy.resnet_encoder import ResNetEncoder
 from diffusion_policy.utils import IterationBasedBatchSampler, worker_init_fn
 
 
@@ -82,7 +82,7 @@ TASK_INSTRUCTIONS = {
 TASK_TYPES = ["active_exploration", "clutter", "super_long_horizon", "tool_using"]
 
 # STRICT requirement
-REQUIRED_H5_SUFFIX = "merged_success_filtered.h5"
+REQUIRED_H5_SUFFIX = "_success_filtered.h5"
 
 STATE_DIM = 9
 ACTION_DIM = 8
@@ -113,9 +113,12 @@ class Args:
     run_tags: List[str] = field(default_factory=lambda: ["diffusion_policy", "lohrbench", "language"])
 
     # Data
-    data_root: str = "/data1/LoHRbench"
+    data_root: str = "./data"
+    preprocessed_root: Optional[str] = None  # rechunked H5 dir (faster I/O)
     num_traj: Optional[int] = None  # max per task
     cache_dir: str = "./cache_lohrbench_dp"
+    num_dataload_workers: int = 8
+    preload_images: bool = False  # load all images into RAM during init
 
     # CLIP
     clip_model_name: str = "openai/clip-vit-base-patch32"
@@ -133,12 +136,14 @@ class Args:
 
     # Diffusion
     diffusion_step_embed_dim: int = 64
-    unet_dims: List[int] = field(default_factory=lambda: [64, 128, 256])
+    unet_dims: List[int] = field(default_factory=lambda: [128, 256, 512])
     n_groups: int = 8
     num_diffusion_iters: int = 100
 
     # Visual encoder
-    visual_feature_dim: int = 256
+    visual_feature_dim: int = 512
+    visual_encoder_type: str = "resnet18"  # "resnet18" or "plain_conv"
+    resnet_pretrained: bool = True
 
     # Normalization
     q_low: float = 0.5
@@ -304,11 +309,14 @@ class LoHRbenchDiffusionDataset(Dataset):
         self.args = args
         os.makedirs(args.cache_dir, exist_ok=True)
 
-        file_list = discover_lohrbench_h5_files(args.data_root)
+        search_root = args.preprocessed_root or args.data_root
+        file_list = discover_lohrbench_h5_files(search_root)
         if not file_list:
             raise FileNotFoundError(
-                f"No LoHRbench files found under {args.data_root} ending with '{REQUIRED_H5_SUFFIX}'"
+                f"No LoHRbench files found under {search_root} ending with '{REQUIRED_H5_SUFFIX}'"
             )
+        if args.preprocessed_root:
+            tqdm.write(f"[DATA] Using preprocessed data from: {args.preprocessed_root}")
 
         tqdm.write(f"[DATA] Found {len(file_list)} HDF5 files (suffix={REQUIRED_H5_SUFFIX})")
         for ttype in TASK_TYPES:
@@ -406,6 +414,40 @@ class LoHRbenchDiffusionDataset(Dataset):
         self.stats = compute_or_load_stats(all_states, all_actions, stats_cache, args.q_low, args.q_high)
         del all_states, all_actions
 
+        # Per-worker HDF5 handle cache (populated lazily in __getitem__)
+        self._h5_cache: Dict[str, h5py.File] = {}
+
+        # Optional: preload all images into RAM
+        self.base_images: Optional[List[np.ndarray]] = None
+        self.hand_images: Optional[List[np.ndarray]] = None
+        if args.preload_images:
+            tqdm.write("[DATA] Preloading all images into RAM (--preload-images)...")
+            self.base_images = [None] * len(self.trajs)
+            self.hand_images = [None] * len(self.trajs)
+            pbar2 = tqdm(total=len(self.trajs), desc="preload_imgs", dynamic_ncols=True, file=sys.stdout)
+            for ti, (hp, tk, ll, _) in enumerate(self.trajs):
+                with h5py.File(hp, "r") as f:
+                    g = f[tk]
+                    self.base_images[ti] = g["obs"]["sensor_data"]["base_camera"]["rgb"][:]
+                    self.hand_images[ti] = g["obs"]["sensor_data"]["hand_camera"]["rgb"][:]
+                pbar2.update(1)
+            pbar2.close()
+            tqdm.write("[DATA] All images preloaded into RAM.")
+
+    def _get_h5(self, path: str) -> h5py.File:
+        """Return a cached HDF5 file handle (one per worker process)."""
+        if path not in self._h5_cache:
+            self._h5_cache[path] = h5py.File(path, "r")
+        return self._h5_cache[path]
+
+    def __del__(self):
+        for fh in self._h5_cache.values():
+            try:
+                fh.close()
+            except Exception:
+                pass
+        self._h5_cache.clear()
+
     def __len__(self) -> int:
         return len(self.slices)
 
@@ -434,22 +476,24 @@ class LoHRbenchDiffusionDataset(Dataset):
         # now exactly pred_horizon
         assert act_seq.shape[0] == self.args.pred_horizon and act_seq.shape[1] == ACTION_DIM
 
-        # Load images on-the-fly (obs_horizon frames)
-        with h5py.File(h5_path, "r") as f:
+        # Load images
+        if self.base_images is not None:
+            # Preloaded path: read from RAM
+            base_rgb = self.base_images[traj_idx][obs_start:obs_end]
+            hand_rgb = self.hand_images[traj_idx][obs_start:obs_end]
+        else:
+            # On-the-fly path: use cached HDF5 handle
+            f = self._get_h5(h5_path)
             g = f[traj_key]
             base_rgb = g["obs"]["sensor_data"]["base_camera"]["rgb"][obs_start:obs_end]
             hand_rgb = g["obs"]["sensor_data"]["hand_camera"]["rgb"][obs_start:obs_end]
 
-        base_t, hand_t = [], []
-        for i in range(base_rgb.shape[0]):
-            b = self.resize(torch.from_numpy(base_rgb[i]).permute(2, 0, 1))
-            h = self.resize(torch.from_numpy(hand_rgb[i]).permute(2, 0, 1))
-            base_t.append(b)
-            hand_t.append(h)
-
-        base_t = torch.stack(base_t, dim=0)
-        hand_t = torch.stack(hand_t, dim=0)
-        rgb = torch.cat([base_t, hand_t], dim=1)  # (obs_horizon, 6, 224, 224)
+        # Vectorized: batch all images into a single resize call (~1.7x faster)
+        all_np = np.concatenate([base_rgb, hand_rgb], axis=0)       # (2*obs_horizon, H, W, C)
+        all_t = torch.from_numpy(all_np).permute(0, 3, 1, 2)       # (N, C, H, W)
+        all_t = self.resize(all_t)                                  # (N, C, 224, 224)
+        n = base_rgb.shape[0]
+        rgb = torch.cat([all_t[:n], all_t[n:]], dim=1)             # (obs_horizon, 6, 224, 224)
 
         # Normalize
         sm = self.stats["state_mean"][0]
@@ -476,11 +520,19 @@ class Agent(nn.Module):
         self.pred_horizon = args.pred_horizon
         self.act_dim = ACTION_DIM
 
-        self.visual_encoder = PlainConv(
-            in_channels=6,
-            out_dim=args.visual_feature_dim,
-            pool_feature_map=True,
-        )
+        if args.visual_encoder_type == "resnet18":
+            self.visual_encoder = ResNetEncoder(
+                out_dim=args.visual_feature_dim,
+                pretrained=args.resnet_pretrained,
+            )
+        elif args.visual_encoder_type == "plain_conv":
+            self.visual_encoder = PlainConv(
+                in_channels=6,
+                out_dim=args.visual_feature_dim,
+                pool_feature_map=True,
+            )
+        else:
+            raise ValueError(f"Unknown visual_encoder_type: {args.visual_encoder_type}")
 
         global_cond_dim = args.obs_horizon * (args.visual_feature_dim + obs_state_dim) + lang_dim
 
@@ -578,12 +630,15 @@ def main():
     batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)
     batch_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
 
+    use_workers = args.num_dataload_workers > 0
     train_loader = DataLoader(
         dataset,
         batch_sampler=batch_sampler,
-        num_workers=0,
+        num_workers=args.num_dataload_workers,
         worker_init_fn=lambda wid: worker_init_fn(wid, base_seed=args.seed),
         pin_memory=(device.type == "cuda"),
+        persistent_workers=use_workers,
+        prefetch_factor=4 if use_workers else None,
     )
 
     agent = Agent(args=args, obs_state_dim=STATE_DIM, lang_dim=dataset.clip_dim).to(device)
@@ -600,6 +655,12 @@ def main():
 
     def save_ckpt(tag: str):
         ema.copy_to(ema_agent.parameters())
+        # Copy batch norm buffers (running_mean, running_var, num_batches_tracked)
+        # from trained agent to ema_agent — EMA only tracks parameters, not buffers
+        agent_bufs = dict(agent.named_buffers())
+        for name, buf in ema_agent.named_buffers():
+            if name in agent_bufs:
+                buf.data.copy_(agent_bufs[name].data)
         path = os.path.join(ckpt_dir, f"{tag}.pt")
         torch.save(
             {
